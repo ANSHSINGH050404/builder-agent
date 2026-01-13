@@ -1,114 +1,164 @@
-import { GoogleGenAI } from "@google/genai";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 import { BASE_PROMPT, getSystemPrompt } from "./prompts";
 import dotenv from "dotenv";
-import fs from "fs";
 import { basePrompt as nodeBasePrompt } from "./defaults/node";
 import { basePrompt as reactBasePrompt } from "./defaults/react";
+
+import cors from "cors";
 dotenv.config();
 
 import express from "express";
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "10mb" }));
+app.use(cors());
 
-const ai = new GoogleGenAI({
-  apiKey: process.env.GEMINI_API_KEY,
+// Simple request logger
+app.use((req, res, next) => {
+  console.log(`${new Date().toISOString()} - ${req.method} ${req.url}`);
+  if (req.method === "POST") {
+    console.log("Body keys:", Object.keys(req.body));
+  }
+  next();
 });
 
+app.get("/", (req, res) => {
+  res.send("Server is running");
+});
+
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || "");
+const model = genAI.getGenerativeModel({ model: "gemini-3-flash-preview" });
+
+app.get("/models", async (req, res) => {
+  try {
+    // This is a bit of a hack to see what's going on
+    res.json({
+      message: "Check server logs for list of models (if I could list them)",
+    });
+  } catch (err) {
+    res.status(500).json({ error: "failed" });
+  }
+});
 
 app.post("/template", async (req, res) => {
-  const prompt = req.body.prompt;
-  const response = await ai.models.generateContent({
-    model: "gemini-3-flash-preview",
-    contents: [
-      {
-        role: "user",
-        parts: [
-          {
-            text: prompt,
-          },
-        ],
-      },
-      {
-        role: "system",
-        parts: [
-          {
-            text: "Return either node or react based on what you things the project should be.Only return the name of the framework. either node or react.Do not return anything extra.",
-          },
-        ],
-      },
-    ],
-  });
-
-  console.log(response.text);
-
-  const answer = response.text;
-
-  if (answer === "react") {
-    res.json({
-      prompts: [
-        BASE_PROMPT,
-        `Here is an artifact that contains all files of the project visible to you.
-        \nConsider the content of ALL files in the project.\n\n
-        ${reactBasePrompt}\n\nWere is a list that exist on the file system but are not being shown to you:\n\n
-        - .gitignore
-        - package-lock.json
-        - .bolt/prompt \n
-        `,
+  try {
+    const prompt = req.body.prompt;
+    console.log(
+      `[${new Date().toISOString()}] Processing /template AI request...`
+    );
+    const result = await model.generateContent({
+      contents: [
+        {
+          role: "user",
+          parts: [
+            {
+              text: `Prompt: ${prompt}\n\nReturn either "node" or "react" based on what you think the project should be. Only return the name of the framework. either "node" or "react". Do not return anything extra.`,
+            },
+          ],
+        },
       ],
-      uiPrompts: [reactBasePrompt],
     });
-    return;
+
+    const response = result.response;
+    const answer = response.text().trim().toLowerCase().replace(/["']/g, "");
+
+    if (answer.includes("react")) {
+      res.json({
+        prompts: [
+          BASE_PROMPT,
+          `Here is an artifact that contains all files of the project visible to you.
+          \nConsider the content of ALL files in the project.\n\n
+          ${reactBasePrompt}\n\nWere is a list that exist on the file system but are not being shown to you:\n\n
+          - .gitignore
+          - package-lock.json
+          - .bolt/prompt \n
+          `,
+        ],
+        uiPrompts: [reactBasePrompt],
+      });
+      return;
+    }
+    if (answer.includes("node")) {
+      res.json({
+        prompts: [
+          `Here is an artifact that contains all files of the project visible to you.
+          \nConsider the content of ALL files in the project.\n\n
+          ${nodeBasePrompt}\n\nWere is a list that exist on the file system but are not being shown to you:\n\n
+          - .gitignore
+          - package-lock.json
+          - .bolt/prompt \n
+          `,
+        ],
+        uiPrompts: [nodeBasePrompt],
+      });
+      return;
+    }
+    res.status(400).send("Invalid answer");
+  } catch (err: any) {
+    console.error("Template error:", err);
+    res
+      .status(500)
+      .json({ error: "Internal Server Error", details: err.message });
   }
-  if (answer === "node") {
-    res.json({
-      prompts: [
-        `Here is an artifact that contains all files of the project visible to you.
-        \nConsider the content of ALL files in the project.\n\n
-        ${reactBasePrompt}\n\nWere is a list that exist on the file system but are not being shown to you:\n\n
-        - .gitignore
-        - package-lock.json
-        - .bolt/prompt \n
-        `,
-      ],
-      uiPrompts: [nodeBasePrompt],
-    });
-    return;
-  }
-  res.status(400).send("Invalid answer");
-  return;
 });
 
-app.post("/chat",async(req,res) =>{
-  const messages=req.body.messages
-  const response = await ai.models.generateContent({
-    model: "gemini-3-flash-preview",
-    contents:[
-      {
-        role:"system",
-        parts:[
-          {
-            text:getSystemPrompt()
-          }
-        ]
-      },
-      {
-        role:"user",
-        parts:[
-          {
-            text:messages
-          }
-        ]
+app.post("/chat", async (req, res) => {
+  try {
+    const messages = req.body.messages;
+    console.log(`[${new Date().toISOString()}] Processing /chat AI request...`);
+
+    // Merge consecutive messages with the same role
+    const mergedMessages: any[] = [];
+    messages.forEach((msg: any) => {
+      const role = msg.role === "assistant" ? "model" : "user";
+      if (
+        mergedMessages.length > 0 &&
+        mergedMessages[mergedMessages.length - 1].role === role
+      ) {
+        mergedMessages[
+          mergedMessages.length - 1
+        ].parts[0].text += `\n\n${msg.content}`;
+      } else {
+        mergedMessages.push({
+          role,
+          parts: [{ text: msg.content }],
+        });
       }
-    ]
-  });
+    });
 
-  console.log(response.text);
-  res.json({});
+    console.log(
+      "Message roles being sent:",
+      mergedMessages.map((m) => m.role)
+    );
 
-})
+    const result = await model.generateContent({
+      systemInstruction: getSystemPrompt(),
+      contents: mergedMessages,
+    });
+
+    const text = result.response.text();
+    console.log(`[${new Date().toISOString()}] /chat AI Request complete.`);
+    console.log(`Contains boltArtifact: ${text.includes("<boltArtifact")}`);
+    res.json({
+      response: text,
+    });
+  } catch (err: any) {
+    console.error("Chat error:", err);
+    res
+      .status(500)
+      .json({ error: "Internal Server Error", details: err.message });
+  }
+});
 
 app.listen(3000, () => {
-  console.log("Server started on port 3000");
+  console.log("🚀 Server is running on http://localhost:3000");
+  console.log("Ready to handle /template and /chat requests.");
+  console.log("Environment check:", {
+    hasApiKey: !!process.env.GEMINI_API_KEY,
+    keyPrefix: process.env.GEMINI_API_KEY
+      ? process.env.GEMINI_API_KEY.slice(0, 4)
+      : "NONE",
+    port: 3000,
+  });
 });
 
 // async function main() {
